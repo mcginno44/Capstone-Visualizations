@@ -1,0 +1,522 @@
+---
+title: "capstone"
+author: "Owen McGinnis"
+date: "2025-10-06"
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(stringr)
+library(data.table)
+library(tidyverse)
+library(stats)
+library(ggthemes)
+library(ggmosaic)
+library(lubridate)
+library(hms)
+library(plotly)
+library(rmdformats)
+```
+
+## Cleaning Chunk 1
+
+```{r}
+##cleaning chunk
+schedule_data = read.csv("/Users/omcginnis/Downloads/Fall 2025_Course Schedule Master_For STA 382_082225(1).xlsx - WFU - OUR - Course Schedule Mas.csv") ## reading in data
+colnames(schedule_data) = gsub("\\.", "_", colnames(schedule_data)) ##not necessary, replacing all commas with underscores
+final_wake_space = schedule_data |>
+  filter(Campus == "Wake Downtown Campus (IQ)" | Campus == "Reynolda Campus") |> ## selecting only on-campus classes(getting rid of abroad) 
+  filter(Section_Status == "Open" | Section_Status == "Waitlist" | Section_Status == "Closed") |> ## getting rid of cancelled classes
+  filter(Department != "School of Business") |> 
+  filter(Department != "School of Divinity") |> ## getting rid of Business School and Divinity School
+  filter(Academic_Level == "Undergraduate")  |> ## selecting only undergrad courses
+  filter(Instructional_Format != "Independent Study" & Instructional_Format != "Research") |> ## these types had no rooms assigned, so not relevant to our question
+  filter(Section_Capacity != 0) |>
+  filter(Enrollment_Count != 0) |>
+  select(c("Academic_Period","Department", "Campus", "Course_Number"      ,"Section_Number","Section", "Section_Status", "Enrollment_Count", "Section_Capacity", "Total_Section_Seat_s_Available", "Wait_List_Capacity", "Waitlist_Count", "Meeting_Patterns", "Meeting_Day_Patterns" ,"Locations__Building_Room_" , "Delivery_Mode", "Instructional_Format", "Course_Section_Overlaps")) ## selecting various columns
+overlaps = c()
+for(i in 1:nrow(final_wake_space)){
+  
+  if(final_wake_space[i,"Course_Section_Overlaps"]!=""){
+    overlaps <- c( overlaps, which(final_wake_space$Section == final_wake_space[i,"Course_Section_Overlaps"]))
+  }
+} 
+
+## essentially, if a section has an overlap, this code guarantees there is only one listing for that section
+```
+
+## Cleaning Chunk 2
+
+```{r}
+##Correcting all sections with double room assignments or double meeting patterns
+reynolda_space = final_wake_space |>
+  filter(Campus == "Reynolda Campus")
+reynolda_space$ID <-1:nrow(reynolda_space) ## giving each row a number to refer to later
+doubles = reynolda_space |>
+  filter(grepl("\n\n", Locations__Building_Room_) == TRUE) ## checking which rows are problem rows(have two locations listed)
+doubles_list = c()
+
+for(i in 1:nrow(doubles)){
+  doubles_list[i] = doubles[i,"ID"] ##holding row numbers for iteration
+}
+list = c()
+
+for(i in 1:nrow(doubles)){ 
+new = reynolda_space[c(doubles_list[i],doubles_list[i]),] ## generating a new data frame to hold the duplicated rows
+holder <-unlist(strsplit(reynolda_space[doubles_list[i],"Meeting_Patterns"], split="\n\n")) ## splitting the string on the R-generated character for a space
+
+new[1,"Meeting_Patterns"] <-holder[1]
+new[2,"Meeting_Patterns"] <-holder[2] ## row 1 gets what is before the "\n\n" and row 2 gets what is after
+##
+
+holder <-unlist(strsplit(reynolda_space[doubles_list[i],"Meeting_Day_Patterns"],split="\n\n"))
+
+new[1,"Meeting_Day_Patterns"] <-holder[1]
+new[2,"Meeting_Day_Patterns"] <-holder[2] ## same as above
+
+holder= unlist(strsplit(as.character(reynolda_space[doubles_list[i],"Locations__Building_Room_"]),split="\n\n"))
+new[1,"Locations__Building_Room_"] <-holder[1]
+new[2,"Locations__Building_Room_"] <-holder[2]
+
+list[[i]] = new 
+list_r_2 = rbindlist(list)## all the corrected rows combined into one set
+} ## for each section with two different rooms listed, there also existed two different meeting patterns, hence why we changed all 3 variables
+
+filtered = reynolda_space[!grepl("\n\n", reynolda_space$Locations__Building_Room_), ] ## removing all rows that had a double room(to allow us to reinsert the corrected two rows in their place)
+temp_space = rbind(filtered, list_r_2) ## placing the corrected rows back in the data set
+temp_space$ID <-1:nrow(temp_space) ## now, from the resulting set, there are still some sections with two meeting patterns, but not two locations
+## the following is the exact same logic as before, just for meeting patterns
+doubs = temp_space |>
+  filter(grepl("\n\n", Meeting_Day_Patterns))
+doubs_list = c()
+for(i in 1:nrow(doubs)){
+  doubs_list[i] = doubs[i,"ID"] ##holding row numbers for iteration
+}
+list2 = c()
+for(i in 1:nrow(doubs)){
+  new = temp_space[c(doubs_list[i],doubs_list[i]),]
+  holder <-unlist(strsplit(temp_space[doubs_list[i],"Meeting_Patterns"], split="\n\n"))
+
+new[1,"Meeting_Patterns"] <-holder[1]
+new[2,"Meeting_Patterns"] <-holder[2]
+
+holder <-unlist(strsplit(temp_space[doubs_list[i],"Meeting_Day_Patterns"],split="\n\n"))
+
+new[1,"Meeting_Day_Patterns"] <-holder[1]
+new[2,"Meeting_Day_Patterns"] <-holder[2]
+list2[[i]] = new
+list_r = rbindlist(list2)
+}
+filtered2 = temp_space[!grepl("\n\n", temp_space$Meeting_Day_Patterns), ]
+reynolda_campus = rbind(filtered2, list_r) ## this is the final data set
+```
+
+## Sanity Check
+
+```{r}
+reynolda_campus |>
+  group_by(Locations__Building_Room_) |>
+  summarise(count = n())
+```
+
+## Crunch Time Investigation
+```{r}
+by_building = reynolda_campus |>
+  mutate(building = str_extract(Locations__Building_Room_, "^[A-Za-z]+")) |>
+  group_by(building, Meeting_Patterns) |>
+  mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F"))
+  # summarise(count = n(), .groups = "drop")
+by_building |>
+  filter(building == "Farrell")
+```
+
+
+```{r}
+meetings_long = by_building |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  
+
+day_counts_by_building = meetings_long |>
+  mutate(building = word(Locations__Building_Room_,1)) |> ##need to read until the first space(just to adjust Kirby-Manchester)
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(building, day) |>
+  summarise(count = n(), .groups = "drop")
+
+plotly::ggplotly(ggplot(day_counts_by_building, aes(x = day, y = count, fill = day)) + geom_bar(stat = "identity") + facet_wrap(~ building, scales = "free_y") + labs(title = "Number of Classes per Day by Building", x = "Day", y = "Count") + theme(axis.text.x = element_text(angle = 45, hjust = 1)) )
+```
+
+```{r}
+plotly::ggplotly(ggplot(day_counts_by_building, aes(x = day, y = building, fill = count)) + geom_tile(color = "white") +  scale_fill_gradient(low = "darkgreen", high = "red") + labs(title = "Number of Classes per Day by Building", x = "Day", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+```{r}
+pattern_counts_by_building = reynolda_campus |>
+  mutate(building = word(Locations__Building_Room_,1)) |>
+  group_by(building, Meeting_Day_Patterns) |>
+  summarise(count = n(), .groups = "drop")
+plotly::ggplotly(ggplot(pattern_counts_by_building, aes(x = Meeting_Day_Patterns, y = building, fill = count)) + geom_tile(color = "white") +  scale_fill_gradient(low = "darkgreen", high = "red") + labs(title = "Number of Classes per Pattern by Building", x = "Pattern", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+```{r}
+## save for later, trying to create a heatmap for individual rooms(could even go by building and do all the room options by building), could also do the most common buildings(Kirby-Manchester, Greene, Carswell, Tribble, Winston, Salem, Olin, Scales, Wait Chapel, Worrell)
+day_counts_by_room = meetings_long |>
+  mutate(building = str_extract(Locations__Building_Room_, "^[A-Za-z]+")) |>
+  filter(building == "Kirby") |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(Locations__Building_Room_, day) |>
+  summarise(count = n(), .groups = "drop")
+plotly::ggplotly(ggplot(day_counts_by_room, aes(x = day, y = Locations__Building_Room_, fill = count)) + geom_tile(color = "white") +  scale_fill_gradient(low = "darkgreen", high = "red") + labs(title = "Number of Classes per Day by Room for Kirby-Manchester", x = "Day", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+```{r}
+daypattern_counts_by_room = reynolda_campus |>
+  mutate(building = str_extract(Locations__Building_Room_, "^[A-Za-z]+")) |>
+  filter(building == "Kirby") |>
+  group_by(Locations__Building_Room_, Meeting_Day_Patterns) |>
+  summarise(count = n(), .groups = "drop")
+
+plotly::ggplotly(ggplot(daypattern_counts_by_room, aes(x = Meeting_Day_Patterns, y = Locations__Building_Room_, fill = count)) + geom_tile(color = "white") +  scale_fill_gradient(low = "darkgreen", high = "red") + labs(title = "Number of Classes per Pattern by Room for Kirby-Manchester", x = "Pattern", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+```{r}
+pattern_enrollment_by_building = reynolda_campus |>
+  mutate(building = str_extract(Locations__Building_Room_, "^[A-Za-z]+")) |>
+  group_by(building, Meeting_Day_Patterns) |>
+  summarise(total_students = sum(Enrollment_Count))
+plotly::ggplotly(ggplot(pattern_enrollment_by_building, aes(x = Meeting_Day_Patterns, y = building, fill = total_students)) + geom_tile(color = "white") +  scale_fill_gradient(low = "darkgreen", high = "red") + labs(title = "Number of Students per Day by Building", x = "Day", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+```{r}
+day_enrollment_by_building = meetings_long |>
+  mutate(building = str_extract(Locations__Building_Room_, "^[A-Za-z]+")) |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(building, day) |>
+  summarise(total_students = sum(Enrollment_Count))
+```
+
+```{r}
+plotly::ggplotly(ggplot(day_enrollment_by_building, aes(x = day, y = building, fill = total_students)) + geom_tile(color = "white") +  scale_fill_gradient(low = "darkblue", high = "yellow") + labs(title = "Number of Students per Day by Building", x = "Day", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+```{r}
+peak_space = reynolda_campus |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:30:00") ~ "pre_peak", time <= as_hms("13:59:59") ~ "peak", time <= as_hms("14:00:00") ~ "two_oclock", time >= as_hms("15:00:00") ~ "post_peak", TRUE ~ NA_character_)
+  ) 
+post_peak = peak_space |>
+  filter(time_block == "post_peak")
+peak = peak_space |>
+  filter(time_block == "peak")
+pre_peak = peak_space |>
+  filter(time_block == "pre_peak")
+two_oclock = peak_space |>
+  filter(time_block == "two_oclock")
+```
+
+## Pie Chart
+```{r}
+peak_numbers = peak_space |>
+  mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_")) |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(time_block, day) |>
+  summarise(count = n(), pct_classes = count / nrow(peak_space))
+peak_numbers = na.omit(peak_numbers)
+peak_numbers$time_block = factor(peak_numbers$time_block, levels = c("pre_peak", "peak", "two_oclock", "post_peak"))
+```
+
+```{r}
+plot_ly(peak_numbers, labels = ~time_block, values = ~pct_classes, marker = list(colors = c('yellow', 'purple', 'steelblue', 'black')), type = 'pie') |> layout(title = "Overall Distribution of Classes by Time Block")
+```
+
+
+## Mosaic Plot 1
+```{r}
+plotly::ggplotly(ggplot(peak_numbers) + geom_mosaic(aes(weight = pct_classes, x = product(day), fill = time_block)) + labs(x = "Day", y = "Time Block", title = "Percentage of Classes by Day by Time Block", fill = "Time Block") + scale_fill_manual(values = colorblind_pal()(8)))
+```
+
+
+```{r}
+peak_space = meetings_long |>
+  mutate(building = word(Locations__Building_Room_,1)) |> ##need to read until the first space(just to adjust Kirby-Manchester)
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "9:30 and Before", time <= as_hms("13:59:59") ~ "9:30 to 1:59", time <= as_hms("14:00:00") ~ "2:00 to 2:59", time >= as_hms("15:00:00") ~ "3:00 and later", TRUE ~ NA_character_)) 
+post_peak = peak_space |>
+  filter(time_block == "3:00 and later") |>
+  group_by(building, day) |>
+  summarise(count = n(), .groups = "drop")
+peak = peak_space |>
+  filter(time_block == "9:30 to 1:59") |>
+  group_by(building, day) |>
+  summarise(count = n(), .groups = "drop")
+pre_peak = peak_space |>
+  filter(time_block == "9:30 and Before") |>
+  group_by(building, day) |>
+  summarise(count = n(), .groups = "drop")
+two_oclock = peak_space |>
+  filter(time_block == "2:00 to 2:59") |>
+  group_by(building, day) |>
+  summarise(count = n(), .groups = "drop")
+```
+
+## Heatmaps
+```{r}
+plotly::ggplotly(ggplot(pre_peak, aes(x = day, y = building, fill = count)) + geom_tile(color = "black") +  scale_fill_gradient(low = "darkblue", high = "yellow") + labs(title = "Pre-Peak(Classes Starting 9:29am and earlier)", x = "Day", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+```{r}
+plotly::ggplotly(ggplot(peak, aes(x = day, y = building, fill = count)) + geom_tile(color = "black") +  scale_fill_gradient(low = "darkblue", high = "yellow") + labs(title = "Peak Time(Classes Starting between 9:30am and 1:59pm)", x = "Day", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+```{r}
+plotly::ggplotly(ggplot(two_oclock, aes(x = day, y = building, fill = count)) + geom_tile(color = "black") +  scale_fill_gradient(low = "darkblue", high = "yellow") + labs(title = "Peakest Peak Time(Classes Starting between 2:00 and 2:59pm)", x = "Day", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+```{r}
+plotly::ggplotly(ggplot(post_peak, aes(x = day, y = building, fill = count)) + geom_tile(color = "black") +  scale_fill_gradient(low = "darkblue", high = "yellow") + labs(title = "Post-Peak(Classes Starting 3:00pm and later)", x = "Day", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+
+```{r}
+counts_peak = peak_space |>
+  group_by(time_block, day) |>
+  summarise(count = n(), .groups = "drop") |>
+  arrange(desc(count))
+```
+```{r}
+ggplotly(ggplot(data = counts_peak, aes(x = day, y = count, fill = time_block)) + geom_bar(stat= "identity") + scale_fill_manual(values = colorblind_pal()(8)) + labs(x = "Day", y = "Count", title ="Classes per Day for Each Time Block", fill = "Time Block"))
+```
+
+## Creating data set(can be deleted)
+```{r}
+#getwd()
+#write.csv(reynolda_campus, "reynolda_campus.csv",row.names=FALSE)
+```
+
+
+
+## General Use Room Work
+```{r}
+gen_use_rooms = read.csv("/Users/omcginnis/Downloads/Wake Forest College Reynolda and Wake Downtown Campus General-Use Classrooms and Student Seat Count_Updated August 2025.xlsx - Sheet1.csv")
+gen_use = gen_use_rooms |>
+  select(Room) |>
+  set_names("Locations__Building_Room_")
+gen_use_space = inner_join(reynolda_campus,gen_use, by = "Locations__Building_Room_")
+gen_use_space 
+```
+
+
+
+```{r}
+start_time_counts = reynolda_campus |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "pre_peak", time <= as_hms("13:59:59") ~ "peak", time <= as_hms("14:00:00") ~ "two_oclock", time >= as_hms("15:00:00") ~ "post_peak", TRUE ~ NA_character_))|>
+   mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(time, day) |>
+  summarise(count = n()) |>
+  arrange(desc(count))
+```
+
+## Classes by Day By Start Time
+```{r}
+plotly::ggplotly(ggplot(start_time_counts, aes(x = time, y = day, fill = count)) + geom_tile(color = "black") + scale_fill_gradient(low = "darkblue", high = "yellow") + labs(x = "Time(Military)", y = "Day", title = "Classes by Day by Start Time") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+
+
+## General Use Visualizations
+```{r}
+gen_use_counts = gen_use_space |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "pre_peak", time <= as_hms("13:59:59") ~ "peak", time <= as_hms("14:00:00") ~ "two_oclock", time >= as_hms("15:00:00") ~ "post_peak", TRUE ~ NA_character_))|>
+  mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(time, day) |>
+  summarise(count = n()) |>
+  arrange(desc(count))
+plotly::ggplotly(ggplot(gen_use_counts, aes(x = time, y = count, fill = day)) + geom_bar(stat = "identity", color = "black") + labs(x = "Time(Military)", y = "Count", title = "Classes by Day in General-Use Classrooms by Start Time"))
+```
+
+```{r}
+plotly::ggplotly(ggplot(gen_use_counts, aes(x = time, y = day, fill = count)) + geom_tile(color = "black") + scale_fill_gradient(low = "darkblue", high = "yellow") + labs(x = "Time(Military)", y = "Day", title = "Classes by Day in General-Use Classrooms by Start Time") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+
+```{r}
+gen_use_counts = gen_use_space |>
+    mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "Pre-9:30", time <= as_hms("13:59:59") ~ "Between 9:30 and 1:59", time <= as_hms("14:00:00") ~ "Between 2:00 and 2:59", time >= as_hms("15:00:00") ~ "3:00 and After", TRUE ~ NA_character_))|>
+  group_by(time_block, day) |>
+  summarise(count = n(), pct_classes = n()/ nrow(gen_use_space))
+gen_use_counts = na.omit(gen_use_counts)
+```
+## Mosaic Plot 2
+```{r}
+plotly::ggplotly(ggplot(gen_use_counts) + geom_mosaic(aes(x = product(day), weight = pct_classes, fill = time_block)) + scale_fill_manual(values = colorblind_pal()(8)) + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)) + labs(x = "Day", y = "Percentage of Classes", title = "Percentage of Classes in General Use Classrooms by Block", fill = "Time Block")) 
+```
+
+
+```{r}
+gen_use_space |>
+  group_by(Locations__Building_Room_) |>
+  summarise(count = n()) |>
+  arrange(desc(count))
+```
+
+## Downtown
+```{r}
+downtown = read.csv("/Users/omcginnis/Downloads/WakeDowntown.csv")
+downtown = downtown |>
+  filter(Room.ID !="IQ-BLG60SOUTH-3506") |>
+  select(c("Academic.Period","Department", "Campus", "Course.Number"      ,"Section.Number","Section", "Enrollment.Count", "Meeting.Patterns", "Meeting.Day.Patterns" ,"Room.ID" , "Delivery.Mode"))
+downtown_counts = downtown |>
+mutate(time_str = str_extract(Meeting.Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "pre_peak", time <= as_hms("13:59:59") ~ "peak", time <= as_hms("14:00:00") ~ "two_oclock", time >= as_hms("15:00:00") ~ "post_peak", TRUE ~ NA_character_))|>
+   mutate(days = str_extract(Meeting.Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")))  |>
+  group_by(time, day) |>
+  summarise(count = n()) |>
+  arrange(desc(count))
+by_room = downtown |>
+mutate(time_str = str_extract(Meeting.Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "pre_peak", time <= as_hms("13:59:59") ~ "peak", time <= as_hms("14:00:00") ~ "two_oclock", time >= as_hms("15:00:00") ~ "post_peak", TRUE ~ NA_character_))|>
+   mutate(days = str_extract(Meeting.Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(Room.ID, day) |>
+  summarise(count = n()) |>
+  arrange(desc(count))
+```
+```{r}
+plotly::ggplotly(ggplot(downtown_counts, aes(x = time, y = day, fill = count)) + geom_tile(color = "black") + scale_fill_gradient(low = "darkblue", high = "yellow") + labs(x = "Time(Military)", y = "Day", title = "Classes by Day Downtown by Start Time") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+```{r}
+plotly::ggplotly(ggplot(by_room, aes(x = day, y = Room.ID, fill = count)) + geom_tile(color = "black") + scale_fill_gradient(low = "darkblue", high = "yellow") + labs(x = "Time(Military)", y = "Day", title = "Classes by Day Downtown by Room") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+## Half Semester 1
+```{r}
+second_half = reynolda_campus |>
+  filter(Academic_Period != "2025 Fall First Half of Term") 
+first_half = reynolda_campus |>
+  filter(Academic_Period != "2025 Fall Second Half of Term") 
+```
+```{r}
+first_half_counts = first_half |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "pre_peak", time <= as_hms("13:59:59") ~ "peak", time <= as_hms("14:00:00") ~ "two_oclock", time >= as_hms("15:00:00") ~ "post_peak", TRUE ~ NA_character_))|>
+   mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(time, day) |>
+  summarise(count = n()) |>
+  arrange(desc(count))
+second_half_counts = second_half |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "pre_peak", time <= as_hms("13:59:59") ~ "peak", time <= as_hms("14:00:00") ~ "two_oclock", time >= as_hms("15:00:00") ~ "post_peak", TRUE ~ NA_character_))|>
+   mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(time, day) |>
+  summarise(count = n()) |>
+  arrange(desc(count))
+
+```
+```{r}
+plotly::ggplotly(ggplot(first_half_counts, aes(x = time, y = day, fill = count)) + geom_tile(color = "black") + scale_fill_gradient(low = "darkblue", high = "yellow") + labs(x = "Time(Military)", y = "Day", title = "First Half Classes by Day by Start Time") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+```{r}
+plotly::ggplotly(ggplot(second_half_counts, aes(x = time, y = day, fill = count)) + geom_tile(color = "black") + scale_fill_gradient(low = "darkblue", high = "yellow") + labs(x = "Time(Military)", y = "Day", title = " Second Half Classes by Day by Start Time") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+## Half Semester 2
+```{r}
+first_half = reynolda_campus |>
+  filter(Academic_Period == "2025 Fall First Half of Term") 
+second_half = reynolda_campus |>
+  filter(Academic_Period == "2025 Fall Second Half of Term") 
+```
+```{r}
+first_half_counts = first_half |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "pre_peak", time <= as_hms("13:59:59") ~ "peak", time <= as_hms("14:00:00") ~ "two_oclock", time >= as_hms("15:00:00") ~ "post_peak", TRUE ~ NA_character_))|>
+   mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(time, day) |>
+  summarise(count = n()) |>
+  arrange(desc(count))
+second_half_counts = second_half |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "pre_peak", time <= as_hms("13:59:59") ~ "peak", time <= as_hms("14:00:00") ~ "two_oclock", time >= as_hms("15:00:00") ~ "post_peak", TRUE ~ NA_character_))|>
+   mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+  group_by(time, day) |>
+  summarise(count = n()) |>
+  arrange(desc(count))
+
+```
+```{r}
+plotly::ggplotly(ggplot(first_half_counts, aes(x = time, y = day, fill = count)) + geom_tile(color = "black") + scale_fill_gradient(low = "darkblue", high = "yellow") + labs(x = "Time(Military)", y = "Day", title = "First Half Classes by Day by Start Time") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+```{r}
+plotly::ggplotly(ggplot(second_half_counts, aes(x = time, y = day, fill = count)) + geom_tile(color = "black") + scale_fill_gradient(low = "darkblue", high = "yellow") + labs(x = "Time(Military)", y = "Day", title = " Second Half Classes by Day by Start Time") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+```{r}
+first_buildings = first_half |>
+  mutate(building = str_extract(Locations__Building_Room_, "^[A-Za-z]+")) |>
+  mutate(building = word(Locations__Building_Room_,1)) |> ##need to read until the first space(just to adjust Kirby-Manchester)
+  group_by(building, Meeting_Patterns) |>
+  mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "9:30 and Before", time <= as_hms("13:59:59") ~ "9:30 to 1:59", time <= as_hms("14:00:00") ~ "2:00 to 2:59", time >= as_hms("15:00:00") ~ "3:00 and later", TRUE ~ NA_character_))   |>
+  group_by(building, day) |>
+  summarise(count = n(), .groups = "drop")
+second_buildings = second_half |>
+  mutate(building = str_extract(Locations__Building_Room_, "^[A-Za-z]+")) |>
+  mutate(building = word(Locations__Building_Room_,1)) |> ##need to read until the first space(just to adjust Kirby-Manchester)
+  group_by(building, Meeting_Patterns) |>
+  mutate(days = str_extract(Meeting_Patterns, "^[^|]+"), is_Monday = str_detect(days, "M"), is_Tuesday = str_detect(days, "T"), is_Wednesday = str_detect(days, "W"), is_Thursday = str_detect(days, "R"), is_Friday = str_detect(days, "F")) |>
+  pivot_longer(cols = starts_with("is_"), names_to = "day", values_to = "has_class") |>
+  filter(has_class) |>
+  mutate(day = str_remove(day, "is_"))  |>
+  mutate(day = factor(day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))) |>
+mutate(time_str = str_extract(Meeting_Patterns, regex("(?<=\\|)[^-]+")), time = as_hms(parse_date_time(time_str, orders = "I:Mp")), time_block = case_when(time < as_hms("09:29:00") ~ "9:30 and Before", time <= as_hms("13:59:59") ~ "9:30 to 1:59", time <= as_hms("14:00:00") ~ "2:00 to 2:59", time >= as_hms("15:00:00") ~ "3:00 and later", TRUE ~ NA_character_))   |>
+  group_by(building, day) |>
+  summarise(count = n(), .groups = "drop")
+```
+
+```{r}
+plotly::ggplotly(ggplot(first_buildings, aes(x = day, y = building, fill = count)) + geom_tile(color = "black") +  scale_fill_gradient(low = "darkblue", high = "yellow") + labs(title = "First Half by Building", x = "Day", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
+
+```{r}
+plotly::ggplotly(ggplot(second_buildings, aes(x = day, y = building, fill = count)) + geom_tile(color = "black") +  scale_fill_gradient(low = "darkblue", high = "yellow") + labs(title = "Second Half by Building", x = "Day", y = "Building") + theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(angle = 45, hjust = 1)))
+```
